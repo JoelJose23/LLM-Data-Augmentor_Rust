@@ -1,10 +1,13 @@
 use axum::{
+    extract::State,
     routing::post,
     Json, Router,
 };
+use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::path::Path;
+use tokio::sync::mpsc;
 use rand::Rng;
 use rand::seq::SliceRandom;
 use regex::Regex;
@@ -18,15 +21,47 @@ struct PipelineRequest {
 #[derive(Serialize)]
 struct PipelineResponse {
     status: String,
-    extracted_text: String,
-    augmentations_applied: String,
-    augmentation_results: String,
+    message: String,
+}
+
+//Packet for the background workers
+struct PipelineJob{
+    pdf_path: String,
+    augmentations: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+    job_tx: mpsc::Sender<PipelineJob>,
 }
 
 #[tokio::main]
 async fn main() {
-    let app = Router::new().route("/process", post(process_pdf_pipeline));
-    
+    let (job_tx, mut job_rx) = mpsc::channel::<PipelineJob>(100);
+
+    tokio::spawn(async move{
+        println!("Backround Process pipeline worker initialize. Waiting for the jobs...😊");
+        while let Some(job) = job_rx.recv().await {
+            println!("Background worker picked job for: {}", job.pdf_path);
+
+            match extract_text_from_pdf(&job.pdf_path) {
+                Ok(text) => {
+                    let augment = apply_augmentations(&text, &job.augmentations).await;
+                    println!("Augmentation result for {}: {}", job.pdf_path, augment);
+                }
+                Err(err_msg) => {
+                    println!("Error processing the request {}: {}", job.pdf_path, err_msg);
+                }
+                
+            }
+            
+        }
+    });
+
+    let shared_state = Arc::new(AppState {job_tx: job_tx});
+
+    let app = Router::new().route("/process", post(process_pdf_pipeline)).with_state(shared_state);
+
     let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     println!("The Backend is up boys 😎 at http://{}", addr);
 
@@ -34,29 +69,28 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
-async fn process_pdf_pipeline(Json(payload): Json<PipelineRequest>) -> Json<PipelineResponse> {
+async fn process_pdf_pipeline(State(state): State<Arc<AppState>>, Json(payload): Json<PipelineRequest>) -> Json<PipelineResponse> {
     println!("Received request for: {}", payload.pdf_path);
 
     // 1. Extract the actual text from the PDF
-    match extract_text_from_pdf(&payload.pdf_path) {
-        Ok(text) => {
-            // 2. Pass the extracted text to the augmentation logic
-            let augmented = apply_augmentations(&text, &payload.augmentations).await;
-            
+    let job = PipelineJob{
+        pdf_path: payload.pdf_path,
+        augmentations:payload.augmentations
+    };
+
+    match state.job_tx.send(job).await {
+        Ok(_) => {
             Json(PipelineResponse {
-                status: "success".to_string(),
-                extracted_text: text,
-                augmentations_applied: payload.augmentations,
-                augmentation_results: augmented,
+                status: "accepted".to_string(),
+                message: "Job submitted successfully to background worker pipeline.".to_string(),
             })
         }
-        Err(err_msg) => Json(PipelineResponse {
+        Err(_) => Json(PipelineResponse {
             status: "error".to_string(),
-            extracted_text: "".to_string(),
-            augmentations_applied: payload.augmentations,
-            augmentation_results: err_msg,
+            message: "Internal error: pipeline channel closed".to_string()
         }),
     }
+
 }
 
 fn extract_text_from_pdf(file_path: &str) -> Result<String, String> {
