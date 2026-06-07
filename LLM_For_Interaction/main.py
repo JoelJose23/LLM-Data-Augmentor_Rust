@@ -81,6 +81,36 @@ class MultiHeadAttention(nn.Module):
         qkv = self.qkv_proj(x) # Shape: (B * T, 3 * C)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        # Rearrange shapes for multi-
+        # Rearrange shapes for multi-head parallel math: (B, n_head, T, head_size)
+        q = q.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_size).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_size).transpose(1, 2)
 
+        #2. Compute the Attention Matrix (affinity scores)
+        #Multiply Query Vectors by Transposed Key vectors
+        weights = q @ k.transpose(-2, -1) / (self.head_size ** 0.5) # Shape: (B, n_head, T, T)
+
+        #3 Apple the Casual Mask: Fill future paths with -inf
+        # When Softmax hits -inf, it becomes absolute 0% probability!
+        weights = weights.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        weights = f.softmax(weights, dim=-1) # Shape: (B, n_head, T, T)
+
+        #4. Multiply by Value matrix to pull contextual information
+        out = weights @ v # Shape: (B, n_head, T, head_size)
+
+        # Concatenate all heads back together into a C dimension
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        
+        return self.out_projection(out)
+
+class FeedForward(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(), #Modern non-linearity used in GPT models
+            nn.Linear(4 * d_model, d_model)
+        )
+    def forward(self, x):
+        return self.net(x)
 
